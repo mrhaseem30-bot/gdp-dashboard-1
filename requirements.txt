@@ -3,3 +3,4 @@ pandas
 yfinance
 plotly
 TA-Lib
+streamlit-autorefresh
