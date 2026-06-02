@@ -4,110 +4,108 @@ import pandas as pd
 import plotly.graph_objects as go
 import talib
 
-st.set_page_config(page_title="H32 RSI Liquidity Bot", layout="wide")
+# ... (upar wala code same rahega - title, coin selector etc.)
 
-st.title("📊 H32 RSI + Liquidity Bot")
-st.subheader("Smart Liquidity + Multi TF RSI System")
+# ==================== IMPROVED MULTI-TF LIQUIDITY FUNCTION ====================
+def find_swing_highs_lows(df, window=5, min_distance=3):
+    """Swing Highs & Lows detect karega"""
+    highs = []
+    lows = []
+    for i in range(window, len(df) - window):
+        if df['High'].iloc[i] == df['High'].iloc[i-window:i+window+1].max():
+            highs.append((df.index[i], df['High'].iloc[i]))
+        if df['Low'].iloc[i] == df['Low'].iloc[i-window:i+window+1].min():
+            lows.append((df.index[i], df['Low'].iloc[i]))
+    return highs, lows
 
-# Coin Selector
-coins = {
-    "Bitcoin (BTC)": "BTC-USD",
-    "Ethereum (ETH)": "ETH-USD",
-    "Solana (SOL)": "SOL-USD",
-    "Sui (SUI)": "SUI-USD",
-    "Chainlink (LINK)": "LINK-USD"
-}
+def get_liquidity_zones_multi(df, lookback_periods=[20, 60, 252]):
+    """Multiple liquidity zones with different lookbacks"""
+    zones = {"demand": [], "supply": []}
+    
+    for period in lookback_periods:
+        if len(df) < period:
+            continue
+        recent = df.tail(period)
+        
+        highs, lows = find_swing_highs_lows(recent, window=5)
+        
+        # Top Supply Zones (recent significant highs)
+        if highs:
+            supply_levels = sorted([h[1] for h in highs[-4:]], reverse=True)  # last 4 swings
+            zones["supply"].extend(supply_levels)
+        
+        # Bottom Demand Zones (recent significant lows)
+        if lows:
+            demand_levels = sorted([l[1] for l in lows[-4:]])
+            zones["demand"].extend(demand_levels)
+    
+    # Unique + rounded
+    zones["demand"] = sorted(list(set([round(x, 4) for x in zones["demand"]])))
+    zones["supply"] = sorted(list(set([round(x, 4) for x in zones["supply"]])))
+    
+    return zones
 
-selected_coin = st.selectbox("**Select Coin**", list(coins.keys()))
-ticker = coins[selected_coin]
-
-# Timeframe
-tf = st.selectbox("**Main Timeframe**", ["15 Minutes", "1 Hour", "4 Hours", "Daily"], index=1)
-
-# Data Fetch
+# ====================== MAIN DATA FETCH ======================
 @st.cache_data(ttl=60)
 def get_data(ticker):
-    df15 = yf.download(ticker, period="3d", interval="15m")
-    df1h = yf.download(ticker, period="15d", interval="1h")
-    df4h = yf.download(ticker, period="30d", interval="4h")
-    df1d = yf.download(ticker, period="90d", interval="1d")
+    df15 = yf.download(ticker, period="5d", interval="15m")
+    df1h = yf.download(ticker, period="30d", interval="1h")
+    df4h = yf.download(ticker, period="90d", interval="4h")
+    df1d = yf.download(ticker, period="1y", interval="1d")   # 1 year daily
     return df15, df1h, df4h, df1d
 
-try:
-    df15, df1h, df4h, df1d = get_data(ticker)
+# ... data loading aur cleaning same rahega ...
 
-    for df in [df15, df1h, df4h, df1d]:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+# ==================== LIQUIDITY CALCULATION ====================
+live_price = float(df15['Close'].iloc[-1])
 
-    live_price = float(df15['Close'].iloc[-1])
+# Multi Timeframe Liquidity
+liquidity_1h = get_liquidity_zones_multi(df1h, [20, 60])      # \~1 week + 1 month
+liquidity_4h = get_liquidity_zones_multi(df4h, [30, 90])
+liquidity_daily = get_liquidity_zones_multi(df1d, [5, 20, 120])  # 1w, 1m, \~6 months
 
-    # RSI Calculations
-    rsi15 = talib.RSI(df15['Close'], timeperiod=14).iloc[-1]
-    rsi1h = talib.RSI(df1h['Close'], timeperiod=14).iloc[-1]
-    rsi4h = talib.RSI(df4h['Close'], timeperiod=14).iloc[-1]
-    rsi1d = talib.RSI(df1d['Close'], timeperiod=14).iloc[-1]
+# Combine all
+all_demand = sorted(list(set(liquidity_1h["demand"] + liquidity_4h["demand"] + liquidity_daily["demand"])))
+all_supply = sorted(list(set(liquidity_1h["supply"] + liquidity_4h["supply"] + liquidity_daily["supply"])))
 
-    # Liquidity Zones (Recent Swing Highs & Lows)
-    def get_liquidity_zones(df, window=8):
-        low_zone = df['Low'].rolling(window=window).min().tail(5).mean()
-        high_zone = df['High'].rolling(window=window).max().tail(5).mean()
-        return round(low_zone, 4), round(high_zone, 4)
+# Current price position
+near_demand = [z for z in all_demand if abs(z - live_price)/live_price < 0.015]  # 1.5% ke andar
+near_supply = [z for z in all_supply if abs(z - live_price)/live_price < 0.015]
 
-    demand_low, _ = get_liquidity_zones(df1h)
-    _, supply_high = get_liquidity_zones(df1h)
+# ====================== UI DISPLAY ======================
+st.subheader("🔍 Multi-Timeframe Liquidity Zones")
 
-    # Signal Logic
-    if rsi1h < 30 and live_price <= demand_low * 1.005:
-        signal = "🟢 STRONG BUY (Liquidity Grab)"
-        color = "lime"
-        reason = "RSI Oversold + Price at Demand Liquidity Zone"
-    elif rsi1h > 70 and live_price >= supply_high * 0.995:
-        signal = "🔴 STRONG SELL (Liquidity Sweep)"
-        color = "red"
-        reason = "RSI Overbought + Price at Supply Liquidity Zone"
-    else:
-        signal = "⭕ NEUTRAL / WAIT"
-        color = "orange"
-        reason = "No strong liquidity setup right now"
+col1, col2 = st.columns(2)
 
-    # UI
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.metric(f"{selected_coin} Price", f"${live_price:,.4f}")
-    with col2:
-        st.markdown(f"<h2 style='color:{color}; text-align:center;'>{signal}</h2>", unsafe_allow_html=True)
+with col1:
+    st.success("**Demand Zones (Lower Liquidity)**")
+    for zone in all_demand[-6:]:   # last 6 zones
+        dist = ((live_price - zone) / zone) * 100
+        st.write(f"**${zone:,.4f}** → {dist:+.2f}% below price")
 
-    st.info(f"**Reason:** {reason}")
+with col2:
+    st.error("**Supply Zones (Upper Liquidity)**")
+    for zone in all_supply[-6:]:
+        dist = ((zone - live_price) / live_price) * 100
+        st.write(f"**${zone:,.4f}** → {dist:+.2f}% above price")
 
-    # Liquidity Display
-    st.success(f"**Demand Liquidity Zone:** ${demand_low:,.4f}")
-    st.error(f"**Supply Liquidity Zone:** ${supply_high:,.4f}")
+# Current Position
+if near_demand:
+    st.success(f"**Price Near Demand Liquidity:** ${near_demand[0]:,.4f}")
+elif near_supply:
+    st.error(f"**Price Near Supply Liquidity:** ${near_supply[0]:,.4f}")
+else:
+    st.info("Price currently between major liquidity zones")
 
-    # Multi TF RSI
-    st.subheader("Multi-Timeframe RSI")
-    rsi_data = {
-        "15 Min": rsi15,
-        "1 Hour": rsi1h,
-        "4 Hour": rsi4h,
-        "Daily": rsi1d
-    }
+# Signal Logic (Improved)
+if rsi1h < 30 and near_demand:
+    signal = "🟢 STRONG BUY (Liquidity Grab)"
+    color = "lime"
+elif rsi1h > 70 and near_supply:
+    signal = "🔴 STRONG SELL (Liquidity Sweep)"
+    color = "red"
+else:
+    signal = "⭕ NEUTRAL"
+    color = "orange"
 
-    for tf_name, val in rsi_data.items():
-        if val <= 30:
-            st.markdown(f"**{tf_name}:** <span style='color:lime; font-weight:bold;'>{val:.2f} → Oversold</span>", unsafe_allow_html=True)
-        elif val >= 70:
-            st.markdown(f"**{tf_name}:** <span style='color:red; font-weight:bold;'>{val:.2f} → Overbought</span>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"**{tf_name}:** <span style='color:white;'>{val:.2f}</span>", unsafe_allow_html=True)
-
-    # Chart
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df1h.index, open=df1h['Open'], high=df1h['High'],
-                                 low=df1h['Low'], close=df1h['Close']))
-    fig.update_layout(height=600, template="plotly_dark", 
-                      title=f"{selected_coin} - Liquidity View (1H)")
-    st.plotly_chart(fig, use_container_width=True)
-
-except Exception as e:
-    st.error(f"Error: {str(e)}")
+st.markdown(f"<h2 style='color:{color}; text-align:center;'>{signal}</h2>", unsafe_allow_html=True)
