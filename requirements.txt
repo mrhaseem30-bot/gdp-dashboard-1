@@ -1,2 +1,6 @@
 streamlit
 pandas
+yfinance
+plotly
+TA-Lib
+python-dotenv
