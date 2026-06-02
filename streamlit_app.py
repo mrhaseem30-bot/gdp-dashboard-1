@@ -1,10 +1,11 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import talib
+from datetime import datetime, timedelta
+import requests
 
-st.set_page_config(page_title="H32 Liquidity Bot", layout="wide", page_icon="📈")
+st.set_page_config(page_title="H32 Binance Liquidity Bot", layout="wide", page_icon="📈")
 
 st.markdown("""
 <style>
@@ -12,122 +13,127 @@ st.markdown("""
     h1, h2 { color: #00ffcc; }
     .buy { color: #00ff88; font-weight: bold; }
     .sell { color: #ff4444; font-weight: bold; }
-    .high-vol { color: #ffff00; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
-    st.title("⚙️ H32 Liquidity + Volume Bot")
-    coins = {
-        "Bitcoin (BTC)": "BTC-USD",
-        "Ethereum (ETH)": "ETH-USD",
-        "Solana (SOL)": "SOL-USD"
-    }
+    st.title("⚙️ H32 Binance Volume Bot")
+    coins = {"Bitcoin (BTC)": "BTCUSDT", "Ethereum (ETH)": "ETHUSDT", "Solana (SOL)": "SOLUSDT"}
     selected_coin = st.selectbox("Select Coin", list(coins.keys()))
-    ticker = coins[selected_coin]
+    symbol = coins[selected_coin]
     
     lookback = st.selectbox("Lookback Period", 
-        ["1 Day", "1 Week", "1 Month", "3 Months", "6 Months", "1 Year"], 
-        index=2)
+        ["1 Week", "1 Month", "3 Months", "6 Months", "1 Year"], index=3)
+
+# Binance Data Fetch Function
+def get_binance_data(symbol, interval="1d", days=200):
+    try:
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days+30)).timestamp() * 1000)
+        
+        url = f"https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": start_time,
+            "endTime": end_time,
+            "limit": 1000
+        }
+        response = requests.get(url, params=params)
+        data = response.json()
+        
+        df = pd.DataFrame(data, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'CloseTime', 
+                                       'QuoteVolume', 'Trades', 'TakerBuyBase', 'TakerBuyQuote', 'Ignore'])
+        df = df[['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df.astype(float)
+        return df
+    except:
+        st.error("Binance API se data nahi aa raha. Retry kar rahe hain...")
+        return pd.DataFrame()
 
 # Period mapping
-period_map = {"1 Day": 5, "1 Week": 10, "1 Month": 40, "3 Months": 100, "6 Months": 200, "1 Year": 400}
+period_map = {"1 Week": 14, "1 Month": 45, "3 Months": 120, "6 Months": 240, "1 Year": 400}
 days = period_map[lookback]
 
-st.title("📊 H32 RSI + Volume Liquidity Bot")
-st.caption(f"{selected_coin} • {lookback} Lookback • Volume + Liquidity")
-
-# Data Fetch
-@st.cache_data(ttl=30)
-def get_data(ticker):
-    df = yf.download(ticker, period="1y", interval="1d", progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-df = get_data(ticker)
+df = get_binance_data(symbol, "1d", days)
 
 if df.empty or len(df) < 20:
-    st.error("Data fetch failed. Please try again.")
+    st.error("Data fetch failed. Please refresh.")
     st.stop()
 
 live_price = float(df['Close'].iloc[-1])
-recent_df = df.tail(days)
+recent = df.tail(days)
 
-# ==================== VOLUME + LIQUIDITY ANALYSIS ====================
-def get_volume_liquidity_zones(recent_df, live_price):
-    # Simple Volume Profile (Price bins)
-    price_range = pd.cut(recent_df['Close'], bins=30)
-    volume_profile = recent_df.groupby(price_range)['Volume'].sum()
-    
-    # High Volume Nodes (HVN)
-    high_vol_levels = volume_profile.nlargest(8).index
-    high_vol_prices = [interval.mid for interval in high_vol_levels]
-    
-    # Demand Zones (Swing Lows + Volume)
-    demand = recent_df['Low'].rolling(window=5, center=True).min().dropna().tail(8)
-    demand_zones = sorted([round(x, 2) for x in demand])
-    
-    # Supply Zones (Swing Highs + Volume)
-    supply = recent_df['High'].rolling(window=5, center=True).max().dropna().tail(8)
-    supply_zones = sorted([round(x, 2) for x in supply])
-    
-    return demand_zones, supply_zones, [round(p, 2) for p in high_vol_prices]
+st.title("📊 H32 Binance Liquidity + Volume Bot")
+st.caption(f"{selected_coin} • {lookback} • Real Binance Data")
 
-demand_zones, supply_zones, high_vol_zones = get_volume_liquidity_zones(recent_df, live_price)
+# Volume Weighted Liquidity
+def get_liquidity_zones(recent, live_price):
+    # High Volume Zones
+    recent = recent.copy()
+    recent['price_bin'] = pd.cut(recent['Close'], bins=35)
+    vol_profile = recent.groupby('price_bin')['Volume'].sum()
+    high_vol_prices = [round(interval.mid, 2) for interval in vol_profile.nlargest(8).index]
+    
+    # Demand Zones (Recent High Volume Lows)
+    demand_zones = []
+    for i in range(10, len(recent)-5):
+        if recent['Low'].iloc[i] == recent['Low'].rolling(7, center=True).min().iloc[i]:
+            if recent['Volume'].iloc[i] > recent['Volume'].mean() * 0.8:
+                demand_zones.append(round(recent['Low'].iloc[i], 2))
+    
+    # Supply Zones
+    supply_zones = []
+    for i in range(10, len(recent)-5):
+        if recent['High'].iloc[i] == recent['High'].rolling(7, center=True).max().iloc[i]:
+            if recent['Volume'].iloc[i] > recent['Volume'].mean() * 0.8:
+                supply_zones.append(round(recent['High'].iloc[i], 2))
+    
+    return sorted(list(set(demand_zones[-8:]))), sorted(list(set(supply_zones[-8:]))), sorted(list(set(high_vol_prices)))
 
-# RSI
+demand_zones, supply_zones, high_vol_zones = get_liquidity_zones(recent, live_price)
+
 rsi = talib.RSI(df['Close'], timeperiod=14).iloc[-1] if len(df) > 14 else None
 
 # UI
-col1, col2 = st.columns([1, 1])
+col1, col2 = st.columns([1,1])
 with col1:
     st.metric("**CURRENT PRICE**", f"${live_price:,.2f}")
 with col2:
     if rsi:
-        if rsi < 35:
-            st.success(f"RSI: {rsi:.1f} → Strong Buy")
-        elif rsi > 65:
-            st.error(f"RSI: {rsi:.1f} → Strong Sell")
-        else:
-            st.info(f"RSI: {rsi:.1f}")
+        if rsi < 35: st.success(f"RSI {rsi:.1f} → Strong Buy")
+        elif rsi > 65: st.error(f"RSI {rsi:.1f} → Strong Sell")
+        else: st.info(f"RSI {rsi:.1f}")
 
-st.markdown("---")
-st.subheader(f"🔥 {lookback} Volume + Liquidity Zones")
+st.subheader(f"🔥 {lookback} High Volume Liquidity Zones (Binance Real Data)")
 
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 
 with c1:
     st.markdown("**🟢 BUY ZONES (Demand)**", unsafe_allow_html=True)
-    for zone in demand_zones:
-        dist = ((live_price - zone) / zone) * 100
-        if abs(dist) < 3:
-            st.markdown(f"<span class='buy'>**${zone:,.2f}** ← HOT BUY ({dist:+.1f}%)</span>", unsafe_allow_html=True)
-        else:
-            st.write(f"${zone:,.2f} ({dist:+.1f}%)")
+    for z in demand_zones:
+        dist = ((live_price - z) / z) * 100
+        st.markdown(f"<span class='buy'>**${z:,.2f}** ← HOT ENTRY ({dist:+.1f}%)</span>", unsafe_allow_html=True)
 
 with c2:
     st.markdown("**🔴 SELL ZONES (Supply)**", unsafe_allow_html=True)
-    for zone in supply_zones:
-        dist = ((zone - live_price) / live_price) * 100
-        if abs(dist) < 3:
-            st.markdown(f"<span class='sell'>**${zone:,.2f}** ← HOT SELL ({dist:+.1f}%)</span>", unsafe_allow_html=True)
-        else:
-            st.write(f"${zone:,.2f} ({dist:+.1f}%)")
+    for z in supply_zones:
+        dist = ((z - live_price) / live_price) * 100
+        st.markdown(f"<span class='sell'>**${z:,.2f}** ← HOT RESISTANCE ({dist:+.1f}%)</span>", unsafe_allow_html=True)
 
-with c3:
-    st.markdown("**🟡 HIGH VOLUME NODES** (Big Buying/Selling)", unsafe_allow_html=True)
-    for zone in sorted(high_vol_zones):
-        dist = ((live_price - zone) / zone) * 100 if zone < live_price else ((zone - live_price) / live_price) * 100
-        st.write(f"${zone:,.2f} ({dist:+.1f}%)")
+st.markdown("**🟡 HIGH VOLUME NODES** (Jahan sabse zyada trading hui)")
+for z in high_vol_zones:
+    dist = abs(live_price - z) / live_price * 100
+    st.write(f"${z:,.2f} ({dist:.1f}% away)")
 
 # Chart
 fig = go.Figure()
-fig.add_trace(go.Candlestick(x=df.tail(180).index, open=df.tail(180)['Open'], 
-                            high=df.tail(180)['High'], low=df.tail(180)['Low'], 
-                            close=df.tail(180)['Close'], name="Price"))
-fig.add_trace(go.Bar(x=df.tail(180).index, y=df.tail(180)['Volume'], name="Volume", opacity=0.6, marker_color='gray'))
-fig.update_layout(height=650, template="plotly_dark", 
-                  title=f"{selected_coin} - Price + Volume")
+fig.add_trace(go.Candlestick(x=recent.index, open=recent['Open'], high=recent['High'],
+                            low=recent['Low'], close=recent['Close']))
+fig.add_trace(go.Bar(x=recent.index, y=recent['Volume'], name="Volume", opacity=0.5, yaxis="y2"))
+fig.update_layout(height=650, template="plotly_dark", title=f"{selected_coin} - Binance Data")
+fig.update_layout(yaxis2=dict(overlaying='y', side='right'))
 st.plotly_chart(fig, use_container_width=True)
